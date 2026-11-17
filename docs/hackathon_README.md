@@ -1,5 +1,5 @@
 <p align="center">
-	<img src="images/logo.svg" alt="HL Logo" width="300">
+	<img src="../images/logo.svg" alt="HL Logo" width="300">
 </p>
 
 
@@ -22,18 +22,18 @@ Thank you for helping us work on cleaner air and societal impact. We are looking
 
 ## Challenges
 
-> ### [Challenge 1: Spot the outliers](./challenge%201/README.md)
+> ### [Challenge 1: Spot the outliers](../challenge%201/README.md)
 Use smart methods – or a combination of approaches – to automatically identify sensors that produce unusual measurements, helping residents and researchers work with data they can trust.
 
-> ### [Challenge 2: Discover pollution hotspots](./challenge%202/README.md)
+> ### [Challenge 2: Discover pollution hotspots](../challenge%202/README.md)
 Apply state-of-the-art AI techniques to create novel ways of identifying local sources of air pollution based on large volumes of sensor data.
 
-> ### [Challenge 3: Help residents analyse data more easily](./challenge%203/README.md)
+> ### [Challenge 3: Help residents analyse data more easily](../challenge%203/README.md)
 Build an intelligent assistant that helps residents analyse, understand and interpret their sensor data, without needing to be data analysts themselves.
 
 ## Relevant background information
 > [!TIP]
-> As with any data and/or AI related challenge, understanding the domain, hardware and user needs you are working with are crucial for a successful solution. Therefore, we strongly encourage you to read the relevant background information and resources we have put here: [Relevant resources](./docs/resources.md).
+> As with any data and/or AI related challenge, understanding the domain, hardware and user needs you are working with are crucial for a successful solution. Therefore, we strongly encourage you to read the relevant background information and resources we have put here: [Relevant resources](resources.md).
 
 ## Data
 The reference-station, weather and resident-question files are included in `data/`. The Hollandse Luchten sensor tables are distributed separately through Zenodo and are **not included in this repository**. All data is open; no registration or API key is needed to use it.
@@ -43,7 +43,7 @@ The reference-station, weather and resident-question files are included in `data
 > Reference measurements, reference-station metadata, KNMI weather, and resident questions are already available in `data/`.
 
 ### Which data is available?
-We supply five datasets: six structured tables and a collection of labeled-data CSV submissions. **The full column-by-column description of every table is in [Data description](./docs/data.md).**
+We supply five datasets: six structured tables and a collection of labeled-data CSV submissions. **The full column-by-column description of every table is in [Data description](data.md).**
 
 | # | Dataset | Tables | What it contains |
 |---|---|---|---|
@@ -54,7 +54,7 @@ We supply five datasets: six structured tables and a collection of labeled-data 
 | 5 | **Labeled data from Participatief opschonen** | `Semicolon-delimited CSV submissions` in `data/labeled_data/` | Residents' survey answers and assessments of algorithmically flagged measurements from a two-week period, including explanations and resident-reported anomalies. These assessments reflect participants' judgments, not ground-truth labels. |
 
 > [!TIP]
-> Read the [conventions and pitfalls](./docs/data.md#6-conventions-and-pitfalls) before you start: time zones (sensors UTC, Luchtmeetnet fixed UTC+1), hour labelling (start vs. end), missing values, wind-direction codes and sensors without a location are the most common sources of errors.
+> Read the [conventions and pitfalls](data.md#6-conventions-and-pitfalls) before you start: time zones (sensors UTC, Luchtmeetnet fixed UTC+1), hour labelling (start vs. end), missing values, wind-direction codes and sensors without a location are the most common sources of errors.
 
 ### Looking at the data before the hackathon
 The sources behind the data are public. You can explore the same data on the [Hollandse Luchten map](https://hollandse-luchten.org/kaart/), in the [Samen Analyseren Tool](https://analyseren.samenmeten.nl/), via the [Samen Meten API](https://api-samenmeten.rivm.nl/v1.0) and the [Luchtmeetnet API](https://api.luchtmeetnet.nl/open_api). The datasets provided have been prepared for the hackathon. You are also welcome to use the APIs instead. 
@@ -117,8 +117,8 @@ Of course, there are prizes for the winners! The winning team will receive a fan
 
 ## Need (free) AI models and/or GPUs
 You are free to use any tools you like. We understand that for a working solution you might need specific GPU compute and/or use AI-models. In case you don't have this available yourselves, we prepared two short guides as a backup:
-- **[OpenRouter quick start](./docs/openrouter_quickstart.md)**: access AI models (including free ones) through one API key.
-- **[Google Colab quick start](./docs/googlecolab_quickstart.md)**: use a free GPU and notebooks in your browser or directly [from Visual Studio Code](./docs/googlecolab_quickstart.md#option-b-from-inside-visual-studio-code), if you don't have a GPU yourself.
+- **[OpenRouter quick start](openrouter_quickstart.md)**: access AI models (including free ones) through one API key.
+- **[Google Colab quick start](googlecolab_quickstart.md)**: use a free GPU and notebooks in your browser or directly [from Visual Studio Code](googlecolab_quickstart.md#option-b-from-inside-visual-studio-code), if you don't have a GPU yourself.
 
 
 ## Use of tools and generative AI
