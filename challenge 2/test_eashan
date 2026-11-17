@@ -1,0 +1,521 @@
+%%writefile C:/Users/easha/Downloads/air_direction_app.py
+import os
+import json
+import hashlib
+import sqlite3
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+from scipy.spatial import cKDTree, ConvexHull, QhullError
+import plotly.graph_objects as go
+import plotly.express as px
+import streamlit as st
+
+# Streamlit app. Install dependencies and run it using the instructions in chat.
+st.set_page_config(page_title="Air Direction Explorer", page_icon="🌬️", layout="wide")
+
+PM_DEFAULT = r"C:\Users\easha\Downloads\data_sensors.parquet"
+WIND_DEFAULT = r"C:\Users\easha\Downloads\knmi_weather_data.parquet"
+CACHE_DIR = Path.home() / "pollution_dashboard_cache"
+PM_COLUMNS = ["kit_id", "timestamp_from", "pm25_raw", "latitude", "longitude"]
+WIND_COLUMNS = ["station", "time", "lat", "lon", "DD"]
+REGIONS = [("N", 0), ("NE", 45), ("E", 90), ("SE", 135),
+           ("S", 180), ("SW", 225), ("W", 270), ("NW", 315)]
+PALETTE = [[0, "#2166ac"], [0.3, "#67c6e3"], [0.6, "#fce761"], [1, "#cf2936"]]
+BATCH_SIZE = 100_000
+MAX_SENSOR_HOURS = 500_000
+
+
+def to_time(series):
+    kw = {"errors": "coerce", "utc": True}
+    if int(pd.__version__.split(".")[0]) >= 2:
+        kw["format"] = "mixed"
+    return pd.to_datetime(series, **kw)
+
+
+def clean_batch(batch, time_col, numeric, shift, start, end):
+    df = batch.to_pandas()
+    df[time_col] = to_time(df[time_col]).astype("datetime64[ns, UTC]")
+    for col in numeric:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=[time_col] + numeric).copy()
+    for col in numeric:
+        df = df[np.isfinite(df[col])]
+    if df.empty:
+        return df
+    df["hour"] = (df[time_col].astype("int64") // 3_600_000_000_000 + shift).astype("int64")
+    if start is not None:
+        df = df[df.hour >= start]
+    if end is not None:
+        df = df[df.hour < end]
+    return df
+
+
+def file_fingerprint(pm_path, wind_path, start, end, shift):
+    details = []
+    for name in (pm_path, wind_path):
+        p = Path(name).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(f"Cannot find file: {p}")
+        s = p.stat()
+        details.append((str(p.resolve()), s.st_size, s.st_mtime_ns))
+    text = json.dumps([details, start, end, shift, "app-v1"])
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def require_columns(pf, columns, label):
+    available = set(pf.schema_arrow.names)
+    missing = [x for x in columns if x not in available]
+    if missing:
+        raise ValueError(f"{label} is missing columns {missing}. Available: {sorted(available)}")
+
+
+def build_database(pm_path, wind_path, start, end, shift, progress):
+    fingerprint = file_fingerprint(pm_path, wind_path, start, end, shift)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = CACHE_DIR / f"air_{fingerprint}.sqlite"
+    if dest.exists():
+        return str(dest), True
+    pm = pq.ParquetFile(pm_path)
+    wind = pq.ParquetFile(wind_path)
+    require_columns(pm, PM_COLUMNS, "PM file")
+    require_columns(wind, WIND_COLUMNS, "Wind file")
+    has_fh = "FH" in wind.schema_arrow.names
+    tmp = CACHE_DIR / f"air_{fingerprint}.working.sqlite"
+    if tmp.exists():
+        tmp.unlink()
+    con = sqlite3.connect(str(tmp))
+    try:
+        con.executescript("""
+          PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;
+          CREATE TABLE pm(sensor TEXT,hour INTEGER,total REAL,n INTEGER,PRIMARY KEY(sensor,hour));
+          CREATE TABLE sensor_location(sensor TEXT PRIMARY KEY,lat_sum REAL,lon_sum REAL,n INTEGER);
+          CREATE TABLE wind(station TEXT,hour INTEGER,ss REAL,cc REAL,n INTEGER,fs REAL,fn INTEGER,
+                            PRIMARY KEY(station,hour));
+          CREATE TABLE station_location(station TEXT PRIMARY KEY,lat_sum REAL,lon_sum REAL,n INTEGER);
+        """)
+        seen = 0
+        for batch in pm.iter_batches(batch_size=BATCH_SIZE, columns=PM_COLUMNS):
+            seen += batch.num_rows
+            d = clean_batch(batch, "timestamp_from", ["pm25_raw", "latitude", "longitude"], 0, start, end)
+            if not d.empty:
+                d = d[d.kit_id.notna() & (d.pm25_raw >= 0) & d.latitude.between(-90, 90) & d.longitude.between(-180, 180)].copy()
+                d["sensor"] = d.kit_id.astype(str)
+                d = d[d.sensor.str.strip() != ""]
+                if not d.empty:
+                    h = d.groupby(["sensor", "hour"], sort=False).pm25_raw.agg(["sum", "count"]).reset_index()
+                    loc = d.groupby("sensor", sort=False).agg(lat_sum=("latitude", "sum"), lon_sum=("longitude", "sum"), n=("latitude", "size")).reset_index()
+                    con.executemany("INSERT INTO pm VALUES(?,?,?,?) ON CONFLICT(sensor,hour) DO UPDATE SET total=total+excluded.total,n=n+excluded.n",
+                        [(str(s), int(t), float(v), int(n)) for s, t, v, n in h.itertuples(index=False, name=None)])
+                    con.executemany("INSERT INTO sensor_location VALUES(?,?,?,?) ON CONFLICT(sensor) DO UPDATE SET lat_sum=lat_sum+excluded.lat_sum,lon_sum=lon_sum+excluded.lon_sum,n=n+excluded.n",
+                        [(str(s), float(a), float(b), int(n)) for s, a, b, n in loc.itertuples(index=False, name=None)])
+                    con.commit()
+            progress.progress(min(0.49, 0.49 * seen / max(1, pm.metadata.num_rows)), text=f"Reading PM: {seen:,} rows")
+        seen = 0
+        cols = WIND_COLUMNS + (["FH"] if has_fh else [])
+        for batch in wind.iter_batches(batch_size=BATCH_SIZE, columns=cols):
+            seen += batch.num_rows
+            d = clean_batch(batch, "time", ["lat", "lon", "DD"], shift, start, end)
+            if not d.empty:
+                d = d[d.station.notna() & d.DD.between(1, 360) & d.lat.between(-90, 90) & d.lon.between(-180, 180)].copy()
+                d["station_id"] = d.station.astype(str)
+                d = d[d.station_id.str.strip() != ""]
+                if not d.empty:
+                    a = np.deg2rad(d.DD.to_numpy())
+                    d["ss"], d["cc"] = np.sin(a), np.cos(a)
+                    d["fh_num"] = pd.to_numeric(d["FH"], errors="coerce") if has_fh else np.nan
+                    d.loc[~np.isfinite(d.fh_num), "fh_num"] = np.nan
+                    h = d.groupby(["station_id", "hour"], sort=False).agg(ss=("ss", "sum"), cc=("cc", "sum"), n=("DD", "size"), fs=("fh_num", "sum"), fn=("fh_num", "count")).reset_index()
+                    loc = d.groupby("station_id", sort=False).agg(lat_sum=("lat", "sum"), lon_sum=("lon", "sum"), n=("DD", "size")).reset_index()
+                    con.executemany("INSERT INTO wind VALUES(?,?,?,?,?,?,?) ON CONFLICT(station,hour) DO UPDATE SET ss=ss+excluded.ss,cc=cc+excluded.cc,n=n+excluded.n,fs=fs+excluded.fs,fn=fn+excluded.fn",
+                        [(str(s), int(t), float(a), float(b), int(n), float(f), int(k)) for s, t, a, b, n, f, k in h.itertuples(index=False, name=None)])
+                    con.executemany("INSERT INTO station_location VALUES(?,?,?,?) ON CONFLICT(station) DO UPDATE SET lat_sum=lat_sum+excluded.lat_sum,lon_sum=lon_sum+excluded.lon_sum,n=n+excluded.n",
+                        [(str(s), float(a), float(b), int(n)) for s, a, b, n in loc.itertuples(index=False, name=None)])
+                    con.commit()
+            progress.progress(min(0.99, 0.49 + 0.5 * seen / max(1, wind.metadata.num_rows)), text=f"Reading wind: {seen:,} rows")
+        con.close()
+        os.replace(tmp, dest)
+        progress.progress(1.0, text="Data prepared")
+        return str(dest), False
+    except Exception:
+        con.close()
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+@st.cache_data(show_spinner=False)
+def database_info(path):
+    with sqlite3.connect(path) as con:
+        pmin, pmax = con.execute("SELECT MIN(hour),MAX(hour) FROM pm").fetchone()
+        wmin, wmax = con.execute("SELECT MIN(hour),MAX(hour) FROM wind").fetchone()
+        sensors = pd.read_sql_query("SELECT sensor,lat_sum/n AS lat,lon_sum/n AS lon FROM sensor_location ORDER BY sensor", con)
+        stations = pd.read_sql_query("SELECT station,lat_sum/n AS lat,lon_sum/n AS lon FROM station_location ORDER BY station", con)
+    return pmin, pmax, wmin, wmax, sensors, stations
+
+
+def xy(lat, lon, lat0, lon0):
+    return np.column_stack(((np.asarray(lon) - lon0) * 111.32 * np.cos(np.deg2rad(lat0)), (np.asarray(lat) - lat0) * 111.32))
+
+
+def lonlat(points, lat0, lon0):
+    return lon0 + points[:, 0] / (111.32 * np.cos(np.deg2rad(lat0))), lat0 + points[:, 1] / 111.32
+
+
+def cluster_indices(coords, link, min_size):
+    parent = list(range(len(coords)))
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for i, j in cKDTree(coords).query_pairs(link):
+        a, b = find(i), find(j)
+        if a != b:
+            parent[b] = a
+    groups = {}
+    for i in range(len(coords)):
+        groups.setdefault(find(i), []).append(i)
+    return sorted([g for g in groups.values() if len(g) >= min_size], key=len, reverse=True)
+
+
+def generate_candidates(coords, extra_near, extra_far):
+    center = coords.mean(axis=0)
+    radius = float(np.max(np.linalg.norm(coords - center, axis=1)))
+    rows = []
+    for region, angle in REGIONS:
+        for offset in (-15, 0, 15):
+            for extra in (extra_near, extra_far):
+                a = np.deg2rad(angle + offset)
+                p = center + (radius + extra) * np.array([np.sin(a), np.cos(a)])
+                rows.append((region, float(p[0]), float(p[1])))
+    inside = False
+    if len(coords) >= 8:
+        eig = np.linalg.eigvalsh(np.cov(coords.T))
+        ratio = np.sqrt(max(0, eig[0]) / eig[1]) if eig[1] > 0 else 0
+        try:
+            inside = ratio >= 0.35 and ConvexHull(coords).volume >= 0.15
+        except QhullError:
+            inside = False
+    if inside:
+        rows.append(("inside", float(center[0]), float(center[1])))
+        for i in np.unique(np.linspace(0, len(coords) - 1, min(8, len(coords)), dtype=int)):
+            p = 0.55 * center + 0.45 * coords[i]
+            rows.append(("inside", float(p[0]), float(p[1])))
+    result = pd.DataFrame(rows, columns=["region", "x", "y"])
+    result["point"] = result.groupby("region").cumcount() + 1
+    return result, inside
+
+
+@st.cache_data(show_spinner=False)
+def load_cluster(path, sensor_records, spike_q, max_station_km):
+    records = list(sensor_records)
+    count = 0
+    with sqlite3.connect(path) as con:
+        for sensor, station, distance, lat, lon, x, y in records:
+            count += con.execute("SELECT COUNT(*) FROM pm WHERE sensor=?", (sensor,)).fetchone()[0]
+        if count > MAX_SENSOR_HOURS:
+            return None, None, count
+        parts, coverage = [], []
+        for sensor, station, distance, lat, lon, x, y in records:
+            station_used = station if distance <= max_station_km else "__NO_STATION__"
+            d = pd.read_sql_query("""SELECT p.hour,p.total/p.n AS pm,w.ss,w.cc,w.n AS wn,w.fs,w.fn
+                  FROM pm p LEFT JOIN wind w ON p.hour=w.hour AND w.station=? WHERE p.sensor=? ORDER BY p.hour""",
+                  con, params=(station_used, sensor))
+            if d.empty:
+                continue
+            valid = d.wn.notna() & (np.hypot(d.ss.fillna(0), d.cc.fillna(0)) / d.wn.fillna(1) >= 0.1)
+            d["direction"] = np.where(valid, (np.degrees(np.arctan2(d.ss, d.cc)) % 360), np.nan)
+            d["fh_raw"] = np.where(d.fn.fillna(0) > 0, d.fs / d.fn, np.nan)
+            threshold = float(d.pm.quantile(spike_q))
+            d["spike"] = d.pm > threshold
+            d["sensor"], d["station"] = sensor, station
+            d["lat"], d["lon"], d["x"], d["y"] = lat, lon, x, y
+            d["time"] = pd.to_datetime(d.hour, unit="h", utc=True)
+            status = "station too far" if distance > max_station_km else ("no matched wind" if not valid.any() else "matched")
+            coverage.append({"sensor": sensor, "station": station, "distance_km": distance, "PM hours": len(d), "matched wind hours": int(valid.sum()), "spike threshold": threshold, "matched spikes": int((d.spike & valid).sum()), "status": status})
+            parts.append(d)
+    if not parts:
+        return pd.DataFrame(), pd.DataFrame(coverage), count
+    return pd.concat(parts, ignore_index=True), pd.DataFrame(coverage), count
+
+
+def compatibility(dx, dy, dd, width0, growth):
+    a = np.deg2rad(np.asarray(dd, dtype=float))
+    ux, uy = -np.sin(a), -np.cos(a)  # DD is FROM; arrows point TOWARD.
+    down = dx * ux + dy * uy
+    cross = -dx * uy + dy * ux
+    width = width0 + growth * np.maximum(down, 0)
+    return np.where(down > 0, np.exp(-0.5 * (cross / width) ** 2), 0.0)
+
+
+@st.cache_data(show_spinner=False)
+def score_hypotheses(data, candidates, width0, growth, min_hours, min_weight):
+    sums = np.zeros(len(candidates))
+    counts = np.zeros(len(candidates), dtype=int)
+    supports = np.zeros(len(candidates))
+    for sensor, group in data.groupby("sensor", sort=False):
+        d = group.dropna(subset=["direction"])
+        if len(group) < 30 or len(d) < min_hours or not d.spike.any():
+            continue
+        dd, spikes = d.direction.to_numpy(), d.spike.to_numpy(dtype=float)
+        sx, sy = float(d.x.iloc[0]), float(d.y.iloc[0])
+        for j, row in enumerate(candidates.itertuples(index=False)):
+            w = compatibility(sx - row.x, sy - row.y, dd, width0, growth)
+            yes, no = float(w.sum()), float((1 - w).sum())
+            if yes < min_weight or no < min_weight:
+                continue
+            sums[j] += np.dot(w, spikes) / yes - np.dot(1 - w, spikes) / no
+            counts[j] += 1
+            supports[j] += np.dot(w, spikes)
+    result = candidates.copy()
+    result["sensors"] = counts
+    result["score"] = np.where(counts >= 3, sums / np.maximum(counts, 1), np.nan)
+    result["weighted spike sensor-hours"] = supports
+    regions = []
+    for region, g in result.groupby("region", sort=False):
+        valid = g.dropna(subset=["score"])
+        sufficient = len(valid) >= int(np.ceil(len(g) / 2))
+        regions.append({"region": region, "score": float(valid.score.mean()) if sufficient else np.nan,
+            "scored points": len(valid), "tested points": len(g),
+            "min sensors": int(valid.sensors.min()) if len(valid) else 0})
+    return result, pd.DataFrame(regions).sort_values("score", ascending=False, na_position="last")
+
+
+def hour_text(h):
+    return "No data" if h is None else pd.to_datetime(int(h), unit="h", utc=True).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def build_map(snapshot, points, region, source, lat0, lon0, width0, growth, vmax, street):
+    d = snapshot.copy()
+    d["compatibility"] = compatibility(d.x - source.x, d.y - source.y, d.direction, width0, growth)
+    d.loc[d.direction.isna(), "compatibility"] = np.nan
+    d["label"] = d.apply(lambda r: f"Sensor: {r.sensor}<br>PM2.5: {r.pm:.2f}<br>Spike: {'yes' if r.spike else 'no'}<br>Wind FROM: {r.direction:.0f}°<br>Compatibility: {r.compatibility:.2f}" if pd.notna(r.direction) else f"Sensor: {r.sensor}<br>PM2.5: {r.pm:.2f}<br>No matched wind", axis=1)
+    plon, plat = lonlat(points[["x", "y"]].to_numpy(), lat0, lon0)
+    slon, slat = lonlat(np.array([[source.x, source.y]]), lat0, lon0)
+    # Display uses mean wind; scoring uses each sensor's own matched wind.
+    wind_d = d.dropna(subset=["direction"])
+    wx = -np.sin(np.deg2rad(wind_d.direction.to_numpy()))
+    wy = -np.cos(np.deg2rad(wind_d.direction.to_numpy()))
+    norm = np.hypot(wx.mean(), wy.mean()) if len(wind_d) else 0.0
+    plume_lon = plume_lat = None
+    if norm > 0.1:
+        u = np.array([wx.mean(), wy.mean()]) / norm
+        perp = np.array([-u[1], u[0]])
+        start = np.array([source.x, source.y])
+        length = min(10.0, max(2.0, float(np.linalg.norm(d[["x", "y"]].to_numpy() - start, axis=1).max()) + 0.5))
+        end = start + length * u
+        far_width = width0 + growth * length
+        polygon = np.array([start - width0 * perp, start + width0 * perp, end + far_width * perp, end - far_width * perp, start - width0 * perp])
+        plume_lon, plume_lat = lonlat(polygon, lat0, lon0)
+    # Wind lines point TOWARD their tips, opposite the recorded DD direction.
+    visible = wind_d.iloc[::max(1, int(np.ceil(len(wind_d) / 50)))]
+    line_lon, line_lat, tips_lon, tips_lat = [], [], [], []
+    for r in visible.itertuples():
+        a = np.deg2rad(r.direction)
+        tip = np.array([[r.x - 0.35 * np.sin(a), r.y - 0.35 * np.cos(a)]])
+        tx, ty = lonlat(tip, lat0, lon0)
+        line_lon.extend([r.lon, float(tx[0]), None])
+        line_lat.extend([r.lat, float(ty[0]), None])
+        tips_lon.append(float(tx[0]))
+        tips_lat.append(float(ty[0]))
+    if street:
+        fig = go.Figure()
+        if plume_lon is not None:
+            fig.add_trace(go.Scattermapbox(lon=plume_lon, lat=plume_lat, mode="lines", fill="toself", fillcolor="rgba(124,58,237,0.13)", line=dict(color="rgba(124,58,237,0.5)", width=1), name="Illustrative plume"))
+        if line_lon:
+            fig.add_trace(go.Scattermapbox(lon=line_lon, lat=line_lat, mode="lines", line=dict(color="#0f766e", width=2), name="Wind toward tip"))
+            fig.add_trace(go.Scattermapbox(lon=tips_lon, lat=tips_lat, mode="markers", marker=dict(size=5, color="#0f766e"), name="Wind tips"))
+        fig.add_trace(go.Scattermapbox(lon=d.lon, lat=d.lat, mode="markers", text=d.label, hoverinfo="text", name="PM sensors", marker=dict(size=13, color=d.pm, colorscale=PALETTE, cmin=0, cmax=vmax, showscale=True, colorbar=dict(title="PM2.5"))))
+        fig.add_trace(go.Scattermapbox(lon=plon, lat=plat, mode="markers", name=f"{region} points", text=[f"{region}: point {i}" for i in points.point], hoverinfo="text", marker=dict(size=10, color="#7c3aed", opacity=.65)))
+        fig.add_trace(go.Scattermapbox(lon=slon, lat=slat, mode="markers", name="Selected point", marker=dict(size=17, color="#111827")))
+        fig.update_layout(mapbox=dict(style="open-street-map", center=dict(lat=float(d.lat.mean()), lon=float(d.lon.mean())), zoom=10), height=560, margin=dict(l=5, r=5, t=10, b=5), legend=dict(orientation="h"))
+    else:
+        fig = go.Figure()
+        if plume_lon is not None:
+            fig.add_trace(go.Scatter(x=plume_lon, y=plume_lat, mode="lines", fill="toself", fillcolor="rgba(124,58,237,0.13)", line=dict(color="rgba(124,58,237,0.5)", width=1), name="Illustrative plume"))
+        if line_lon:
+            fig.add_trace(go.Scatter(x=line_lon, y=line_lat, mode="lines", line=dict(color="#0f766e", width=2), name="Wind toward tip"))
+            fig.add_trace(go.Scatter(x=tips_lon, y=tips_lat, mode="markers", marker=dict(size=5, color="#0f766e"), name="Wind tips"))
+        fig.add_trace(go.Scatter(x=d.lon, y=d.lat, mode="markers", text=d.label, hoverinfo="text", name="PM sensors", marker=dict(size=12, color=d.pm, colorscale=PALETTE, cmin=0, cmax=vmax, showscale=True, colorbar=dict(title="PM2.5"))))
+        fig.add_trace(go.Scatter(x=plon, y=plat, mode="markers", name=f"{region} points", text=[f"{region}: point {i}" for i in points.point], hoverinfo="text", marker=dict(size=10, color="#7c3aed", opacity=.65)))
+        fig.add_trace(go.Scatter(x=slon, y=slat, mode="markers", name="Selected point", marker=dict(size=16, color="#111827", symbol="x")))
+        fig.update_layout(height=560, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Longitude", yaxis_title="Latitude", legend=dict(orientation="h"), xaxis=dict(scaleanchor="y", scaleratio=np.cos(np.deg2rad(lat0))))
+    return fig, d
+
+
+def main():
+    st.markdown("""<style>.block-container{padding-top:2rem;max-width:1500px} [data-testid="stMetric"]{background:#f4f8ff;padding:14px;border-radius:12px}</style>""", unsafe_allow_html=True)
+    st.title("🌬️ Air Direction Explorer")
+    st.caption("Explore PM spikes, wind and broad source-region hypotheses. Compatibility is not proof of a source.")
+    with st.sidebar:
+        st.header("1 · Load data")
+        pm_path = st.text_input("PM Parquet path", PM_DEFAULT)
+        wind_path = st.text_input("Weather Parquet path", WIND_DEFAULT)
+        restrict = st.checkbox("Use a limited date range", value=False, help="Recommended first: it reduces loading time and memory.")
+        start = end = None
+        if restrict:
+            start_date = st.date_input("From UTC date", value=pd.Timestamp("2025-12-01").date())
+            end_date = st.date_input("Through UTC date", value=pd.Timestamp("2025-12-31").date())
+            start = int(pd.Timestamp(start_date, tz="UTC").value // 3_600_000_000_000)
+            end = int((pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(days=1)).value // 3_600_000_000_000)
+        shift = st.selectbox("Weather timestamp adjustment", [0, -1, 1], format_func=lambda v: {0: "0 hours — same timestamp", -1: "−1 hour — weather marks end of hour", 1: "+1 hour"}[v])
+        st.caption("Naive timestamps are assumed UTC. Confirm the source timezone and hour convention.")
+        if st.button("Prepare data", type="primary", use_container_width=True):
+            if start is not None and start >= end:
+                st.error("The start date must be on or before the end date.")
+            else:
+                bar = st.progress(0, text="Checking files …")
+                try:
+                    path, reused = build_database(pm_path, wind_path, start, end, shift, bar)
+                    st.session_state["prepared_db"] = path
+                    st.session_state["prepared_description"] = f"PM: {pm_path} | Wind: {wind_path} | wind shift: {shift} h"
+                    if reused:
+                        bar.progress(1.0, text="Existing prepared data reused")
+                except Exception as exc:
+                    st.error(f"Could not prepare data: {exc}")
+        st.divider()
+        st.header("2 · Model settings")
+        link = st.slider("Cluster neighbour distance (km)", 0.2, 5.0, 1.0, 0.1)
+        max_station = st.slider("Maximum station distance (km)", 5, 150, 50, 5)
+        spike_q = st.slider("Sensor spike percentile", 75, 99, 90, 1) / 100
+        width0 = st.slider("Starting plume width (km)", 0.05, 2.0, 0.20, 0.05)
+        growth = st.slider("Width growth per km", 0.0, 1.0, 0.20, 0.05)
+        extra_near = st.slider("Nearest exterior test distance (km)", 0.2, 5.0, 0.5, 0.1)
+        extra_far = st.slider("Farthest exterior test distance (km)", 0.3, 10.0, 1.5, 0.1)
+        st.caption("These are adjustable heuristics, not calibrated weather parameters.")
+    if "prepared_db" not in st.session_state:
+        st.info("Enter your paths in the sidebar and press **Prepare data**. For a first run, consider choosing a limited date range.")
+        st.markdown("**What you can explore:** sensor clusters, eight compass regions (plus inside where appropriate), a time slider, maps, timelines and candidate scores.")
+        st.stop()
+    db = st.session_state["prepared_db"]
+    st.caption("Prepared inputs: " + st.session_state["prepared_description"] + ". Changes to file/date/shift settings require pressing Prepare data again.")
+    if extra_far <= extra_near:
+        st.warning("The farthest exterior distance must be larger than the nearest.")
+        st.stop()
+    pmin, pmax, wmin, wmax, sensors, stations = database_info(db)
+    st.write(f"**PM:** {hour_text(pmin)} → {hour_text(pmax)}  |  **Valid wind:** {hour_text(wmin)} → {hour_text(wmax)}")
+    if None in (pmin, pmax, wmin, wmax) or sensors.empty or stations.empty:
+        st.error("No usable PM data, wind direction or station locations. Check your date selection and columns.")
+        st.stop()
+    if max(pmin, wmin) > min(pmax, wmax):
+        st.error("These PM and wind date ranges do not overlap. No real-wind analysis can be performed.")
+        st.stop()
+    st.info("Date ranges overlap; check the coverage table for actual sensor–station hour matches. No synthetic wind is used.")
+    lat0, lon0 = float(sensors.lat.mean()), float(sensors.lon.mean())
+    coords, station_coords = xy(sensors.lat, sensors.lon, lat0, lon0), xy(stations.lat, stations.lon, lat0, lon0)
+    dist, nearest = cKDTree(station_coords).query(coords)
+    groups = cluster_indices(coords, link, 3)
+    if not groups:
+        st.warning("No group has at least three sensors at this neighbour distance. Try changing the cluster setting.")
+        st.stop()
+    options = list(range(len(groups)))
+    selected = st.selectbox("Sensor cluster", options, format_func=lambda i: f"Cluster {i + 1} — {len(groups[i])} sensors")
+    inds = groups[selected]
+    cand, has_inside = generate_candidates(coords[inds], extra_near, extra_far)
+    records = tuple((str(sensors.iloc[i].sensor), str(stations.iloc[int(nearest[i])].station), float(dist[i]), float(sensors.iloc[i].lat), float(sensors.iloc[i].lon), float(coords[i, 0]), float(coords[i, 1])) for i in inds)
+    with st.spinner("Loading selected cluster and calculating sensor baselines …"):
+        data, coverage, count = load_cluster(db, records, spike_q, max_station)
+    if data is None:
+        st.error(f"This cluster has {count:,} sensor-hours; the display limit is {MAX_SENSOR_HOURS:,}. Restrict the date range and prepare the data again.")
+        st.stop()
+    if data.empty:
+        st.warning("No PM observations for this cluster.")
+        st.stop()
+    with st.spinner("Comparing regional hypotheses …"):
+        candidate_scores, region_scores = score_hypotheses(data, cand, width0, growth, 30, 10.0)
+    valid = region_scores.dropna(subset=["score"])
+    metrics = st.columns(4)
+    metrics[0].metric("Sensors", len(inds))
+    metrics[1].metric("PM sensor-hours", f"{len(data):,}")
+    metrics[2].metric("Matched wind hours", f"{data.direction.notna().sum():,}")
+    metrics[3].metric("Inside tested", "Yes" if has_inside else "No")
+    if len(valid) >= 2 and valid.iloc[0].score >= 0.03 and valid.iloc[0].score - valid.iloc[1].score >= 0.01:
+        st.info(f"Exploratory leading region: **{valid.iloc[0].region}**. This is not proof or a probability of a source.")
+    else:
+        st.warning("No clear direction under the current coverage and practical score thresholds.")
+    tabs = st.tabs(["🗺️ Map & time", "📈 Sensor timelines", "🧭 Region comparison", "🔍 Coverage & assumptions"])
+    with tabs[0]:
+        st.subheader("Explore a region and a moment")
+        a, b, c = st.columns([1, 1, 1])
+        region_list = [r for r, _ in REGIONS] + (["inside"] if has_inside else [])
+        region = a.selectbox("Hypothesis region", region_list)
+        points = candidate_scores[candidate_scores.region == region].reset_index(drop=True)
+        point = b.selectbox("Representative point", list(range(len(points))), format_func=lambda i: f"Point {int(points.iloc[i].point)}")
+        source = points.iloc[point]
+        street = c.selectbox("Map style", ["Street map (internet required)", "Coordinate plot (offline)"]).startswith("Street")
+        hours = np.sort(data.hour.unique())
+        k = st.slider("Time step", 0, len(hours) - 1, 0) if len(hours) > 1 else 0
+        st.caption(f"**{hour_text(hours[k])}** — move the slider to inspect another hour. Map colours use the selected cluster's 95th PM percentile as the upper display limit, not health thresholds.")
+        snapshot = data[data.hour == hours[k]].copy()
+        vmax = max(float(data.pm.quantile(.95)), 0.01)
+        fig, snapshot = build_map(snapshot, points, region, source, lat0, lon0, width0, growth, vmax, street)
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Blue → red: lower → higher PM. Purple points: candidates; black: selected point. Green lines point from each sensor toward the wind tip. The purple plume is an illustration using the mean wind across visible sensors; scoring uses each sensor's own wind. Candidate points are hypothetical, not detected sources.")
+        st.dataframe(snapshot[["sensor", "pm", "spike", "station", "direction", "fh_raw", "compatibility"]].rename(columns={"direction": "wind FROM (degrees)", "fh_raw": "FH raw; units unconfirmed"}), use_container_width=True, hide_index=True)
+        with st.expander("▶ Animate PM across time"):
+            nframes = st.slider("Number of hourly frames", 2, 100, min(24, max(2, len(hours))), disabled=len(hours) < 2)
+            chosen = hours[k:k + nframes]
+            if len(chosen) < 2:
+                st.caption("Move the time slider earlier to view an animation.")
+            else:
+                anim = data[data.hour.isin(chosen)].copy()
+                anim["frame"] = anim.time.dt.strftime("%Y-%m-%d %H:%M UTC")
+                ani = px.scatter(anim, x="lon", y="lat", animation_frame="frame", animation_group="sensor", color="pm", hover_name="sensor", hover_data=["spike", "direction"], color_continuous_scale=PALETTE, range_color=[0, vmax], labels={"lon": "Longitude", "lat": "Latitude", "pm": "PM2.5"})
+                ani.update_layout(height=500, xaxis=dict(scaleanchor="y", scaleratio=np.cos(np.deg2rad(lat0))))
+                st.plotly_chart(ani, use_container_width=True)
+                st.caption("Use Play/Pause and the animation slider. This coordinate plot shows PM only; it is not a plume simulation.")
+    with tabs[1]:
+        st.subheader("Sensor PM and wind over time")
+        sensor = st.selectbox("Choose a sensor", sorted(data.sensor.unique()))
+        sd = data[data.sensor == sensor].sort_values("hour")
+        threshold = float(coverage.loc[coverage.sensor == sensor, "spike threshold"].iloc[0])
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=sd.time, y=sd.pm, mode="lines", name="Hourly PM2.5", line=dict(color="#2563eb")))
+        spikes = sd[sd.spike]
+        fig.add_trace(go.Scatter(x=spikes.time, y=spikes.pm, mode="markers", name="Spikes", marker=dict(color="#dc2626", size=6)))
+        fig.add_hline(y=threshold, line_dash="dash", line_color="#f97316", annotation_text=f"{int(spike_q * 100)}th percentile")
+        fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="PM2.5", legend=dict(orientation="h"))
+        st.plotly_chart(fig, use_container_width=True)
+        wd = go.Figure(go.Scatter(x=sd.time, y=sd.direction, mode="markers", marker=dict(size=5, color=np.where(sd.spike, "#dc2626", "#14b8a6")), text=sd.station, hovertemplate="%{x}<br>Wind FROM: %{y:.0f}°<br>Station: %{text}<extra></extra>"))
+        wd.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Wind FROM (degrees)", yaxis=dict(range=[0, 360], tickvals=[0, 90, 180, 270, 360], ticktext=["N", "E", "S", "W", "N"]))
+        st.plotly_chart(wd, use_container_width=True)
+        st.caption("Red points on the wind chart coincide with PM spikes. Missing directions are not plotted.")
+    with tabs[2]:
+        st.subheader("Compare the regions")
+        st.caption("Score = average across sensors of (spike rate when more compatible − spike rate when less compatible), then averaged across tested points. It is not a source probability.")
+        good = region_scores.dropna(subset=["score"])
+        if not good.empty:
+            fig = px.bar(good, x="region", y="score", color="score", color_continuous_scale="RdBu_r", color_continuous_midpoint=0, hover_data=["scored points", "tested points", "min sensors"])
+            fig.update_layout(height=400, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Not enough matched wind and spike coverage to score the regions.")
+        st.dataframe(region_scores, use_container_width=True, hide_index=True)
+        st.download_button("Export regional scores as CSV", region_scores.to_csv(index=False), "region_scores.csv", "text/csv")
+        st.dataframe(candidate_scores, use_container_width=True, hide_index=True)
+    with tabs[3]:
+        st.subheader("Data coverage")
+        st.dataframe(coverage, use_container_width=True, hide_index=True)
+        st.download_button("Export coverage as CSV", coverage.to_csv(index=False), "sensor_coverage.csv", "text/csv")
+        st.markdown("""### Read before interpreting
+- PM spikes are sensor-specific values strictly above the selected percentile; observations are hourly averages.
+- DD is assumed to use standard KNMI **wind-from** coding: 0 calm, 990 variable and 360 north. FH is shown raw if present but is not used: verify its units in the processed file.
+- Naive timestamps are assumed UTC; the wind-hour shift is an explicit setting. Verify both for your files.
+- Each sensor uses the nearest station with valid direction data. Missing station hours are not replaced. Wind may differ between station and sensor.
+- Inside uses an approximate convex-envelope heuristic; it is not a real known boundary. Sparse or linear groups do not get an inside category, which does not rule out nearby sources.
+- Test points cover only a sample of each region. Plume width, grouping and thresholds are assumptions; change them to see whether conclusions are stable.
+- Compatibility represents a widening downwind footprint, not predicted concentration. Speed, travel time, vertical mixing, terrain, background and multiple sources are not modelled.
+- Sensor-hours are not independent episodes; scores are not statistical confidence or causal proof. Wind and PM can co-vary for reasons other than the hypothesised source.
+""")
+
+
+if __name__ == "__main__":
+    main()
+"""
+import sys
+!"{sys.executable}" -m streamlit run "C:/Users/easha/Downloads/air_direction_app.py" --server.address localhost
+"""
+#please use this executable part in another cell for the streamlit app.

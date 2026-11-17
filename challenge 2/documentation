@@ -1,0 +1,18 @@
+Pollution source-direction explorer
+This prototype uses particulate-matter (PM2.5) measurements and wind direction to compare broad hypotheses about where a pollution source might be located. It is an exploratory screening tool, not a method for proving where emissions originated.
+Method
+Group sensors. Sensors connected by nearby neighbours are grouped into clusters. For each cluster, the method considers eight compass regions: N, NE, E, SE, S, SW, W and NW. An additional inside hypothesis is considered only when a simple size-and-shape heuristic treats the cluster as sufficiently two-dimensional. Omitting inside does not rule out a nearby source.
+Identify spikes. PM readings are averaged by sensor and hour. A spike is an hourly value above that sensor’s selected percentile; the default is the 90th percentile.
+Match wind. Each sensor is paired with its nearest eligible weather station, and observations are matched by hour. KNMI DD is treated as the direction the wind comes from. Calm and variable-direction codes are excluded.
+Test source points. Several hypothetical points are tested in each region. For each point, a simple widening downwind footprint gives a higher compatibility weight to sensors near the wind’s path and a lower weight to sensors farther away.
+Compare evidence. For each sensor and candidate point, the method compares the weighted spike rate under more compatible winds with the rate under less compatible winds. It averages these differences across sensors, then across sufficiently covered points in each region. Non-spike observations are included in the comparison. The app can report no clear direction when coverage or score differences are insufficient.
+Visualisation
+The Streamlit dashboard lets users select a cluster, region, candidate point and time. It displays sensor PM readings, wind directions, an illustrative plume, sensor timelines, regional scores and data coverage. The displayed plume uses mean wind across visible sensors; scoring uses each sensor’s matched wind.
+Assumptions and limitations
+Timestamps without timezone information are assumed to be UTC. The weather-hour adjustment must be checked against the input data.
+The nearest weather station may not represent wind at every sensor; missing station hours are not substituted.
+Wind speed (FH), transport time, vertical mixing, terrain, background pollution and multiple sources are not modelled.
+The plume width, cluster boundaries and spike threshold are adjustable heuristics. Candidate points sample each region; they do not cover every possible source location.
+A regional score is not a probability or causal proof. Results depend on the selected data period and assumptions; check coverage and sensitivity to settings.
+Related work
+The use of wind direction to compare high-pollution observations is conceptually related to the conditional probability function: Kim & Hopke (2004). The source–receptor perspective is also related to backward atmospheric modelling: Seibert & Frank (2004). This prototype is a simplified adaptation, not an implementation of their full models.
