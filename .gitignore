@@ -21,3 +21,6 @@ output/
 # Data of the sensor viewer (PMsensorViewNoiseSuppression): a 444 MB Excel copy of the sensor table.
 # Too large for GitHub (limit 100 MB per file); the README says where to download it.
 PMsensorViewNoiseSuppression/PMdata/
+
+# CSV reports written by notebooks/02_pm25_outliers_and_missing_humidity.ipynb
+notebooks/EDA_part_2_*.csv
