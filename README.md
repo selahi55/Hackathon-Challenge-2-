@@ -1,6 +1,8 @@
 # Hollandse Luchten Challenge 2: PM2.5 hotspot screening
 
-How to run our solution on your own computer, from scratch. It works on Windows, macOS and Linux. You need Python 3.11
+How to run our solution on your own computer, from scratch. It has two parts: the hotspot app (steps 1 to 6) and the
+sensor viewer (step 7). The hotspot app works on Windows, macOS and Linux; the sensor viewer is Windows only. For the
+hotspot app you need Python 3.11
 or newer (the tool below installs it if it is missing), about 2 GB of free disk space, and an internet connection (for
 the packages, the data download, and the map tiles in the app). Nothing is uploaded anywhere.
 
@@ -84,15 +86,13 @@ To stop the app, run `streamlit_process.terminate()` in a notebook cell, or clos
 | The map has no background | The map tiles need internet. The analysis itself works without them. |
 | `uv` is not found after installing | Open a new terminal. |
 
-## Optional: the sensor viewer (Windows only)
+## 7. Run the sensor viewer (Windows only)
 
-`PMsensorViewNoiseSuppression/PMsensorViewer.exe` is a separate desktop viewer for the sensor locations. It needs its
-data file `PMdata/data_sensors.xlsx` (444 MB, too large for GitHub):
+The sensor viewer shows the sensor locations. It is too large for GitHub (it includes a 444 MB data file), so it is
+shared through OneDrive:
 
-1. Download it from **[team to insert link before submission]** and save it as
-   `PMsensorViewNoiseSuppression/PMdata/data_sensors.xlsx`.
-2. Start `PMsensorViewer.exe`. It is not code-signed, so Windows may show a warning. Its SHA-256 is
-   `955A72B4524C098420C7305114F442FA251ADD7E73A61F04C8C582061BFBAFD4`; you can check it with
-   `Get-FileHash PMsensorViewNoiseSuppression/PMsensorViewer.exe` in PowerShell.
-
-The app above does not need the viewer.
+1. Open [this OneDrive link](https://onedrive.live.com/?id=%2Fpersonal%2Ff93bed59c336bf2a%2FDocuments%2FCratoMeter&listurl=%2Fpersonal%2Ff93bed59c336bf2a%2FDocuments&redeem=aHR0cHM6Ly8xZHJ2Lm1zL3UvYy9mOTNiZWQ1OWMzMzZiZjJhL0lRREZtRzdrQWFDZlFweWNPbzYtaGhwR0FVeVZVYjU0bkNNaVVVV1QxdTl0NTZNP2U9cWZFblc5&ga=1).
+2. Download the zip folder **PMsensorViewNoiseSuppression4**.
+3. Extract (unzip) it.
+4. Run the `.exe` application file inside the extracted folder. Windows may show a security warning for an unrecognised
+   app.
